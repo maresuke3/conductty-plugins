@@ -1,0 +1,29 @@
+pre-commit:
+  parallel: true
+  commands:
+    no-ipc-token:
+      run: |
+        if git diff --cached --name-only --diff-filter=ACMR | grep -qE '(^|/)\.ipc_token$'; then
+          echo "ERROR: .ipc_token must not be committed." >&2
+          exit 1
+        fi
+    fmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+    check:
+      glob: "{*.rs,Cargo.toml}"
+      run: cargo check --workspace --all-targets
+
+pre-push:
+  commands:
+    fmt:
+      run: cargo fmt --all -- --check
+    clippy:
+      run: cargo clippy --workspace --all-targets
+    test:
+      run: cargo test --workspace
+    windows-check:
+      run: |
+        if command -v rustup >/dev/null 2>&1 && rustup target list --installed | grep -q '^x86_64-pc-windows-gnu$'; then
+          cargo check --target x86_64-pc-windows-gnu --workspace --all-targets
+        fi
