@@ -1,0 +1,164 @@
+name: Release Plugins
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+      platform:
+        description: "Target platform(s) to build and release"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+          - linux
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Plugins (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - platform: macos
+            target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - platform: macos
+            target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - platform: windows
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    if: >-
+      (github.event_name == 'workflow_dispatch' && (inputs.platform == 'all' || inputs.platform == matrix.platform)) ||
+      (github.event_name == 'push' && (
+        (endsWith(github.ref_name, '-windows') && matrix.platform == 'windows') ||
+        (endsWith(github.ref_name, '-macos') && matrix.platform == 'macos') ||
+        (endsWith(github.ref_name, '-linux') && matrix.platform == 'linux') ||
+        (!endsWith(github.ref_name, '-windows') && !endsWith(github.ref_name, '-macos') && !endsWith(github.ref_name, '-linux'))
+      ))
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release plugin binaries
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package artifacts (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          STAGE="conductty-plugins-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "target/${{ matrix.target }}/release/conductty-plugin-github" "dist/${STAGE}/"
+          cp "target/${{ matrix.target }}/release/conductty-plugin-docs" "dist/${STAGE}/"
+          cp README.md "dist/${STAGE}/"
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+
+      - name: Package artifacts (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $stage = "conductty-plugins-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/conductty-plugin-github.exe" "dist/$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/conductty-plugin-docs.exe" "dist/$stage/"
+          Copy-Item "README.md" "dist/$stage/"
+          Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip" -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Determine release tag and checksum filename
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            PLAT="${{ inputs.platform }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            case "${TAG}" in
+              *-windows) PLAT="windows" ;;
+              *-macos)   PLAT="macos" ;;
+              *-linux)   PLAT="linux" ;;
+              *)         PLAT="all" ;;
+            esac
+          fi
+          if [ "${PLAT}" = "all" ]; then
+            SUMS="SHA256SUMS.txt"
+          else
+            SUMS="SHA256SUMS-${PLAT}.txt"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sums=${SUMS}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd dist
+          shopt -s nullglob
+          FILES=(*.tar.gz *.zip)
+          if [ ${#FILES[@]} -gt 0 ]; then
+            sha256sum "${FILES[@]}" > "${{ steps.meta.outputs.sums }}"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS*.txt
