@@ -45,7 +45,7 @@ impl Default for DocsPluginConfig {
     fn default() -> Self {
         Self {
             default_dir: DEFAULT_NOTES_DIR.to_string(),
-            dirs: vec![DEFAULT_NOTES_DIR.to_string(), "./docs".to_string()],
+            dirs: vec![DEFAULT_NOTES_DIR.to_string()],
             limit: 30,
             editor: None,
         }
@@ -97,6 +97,7 @@ struct DrawerSection {
     id: String,
     title: String,
     accent: Option<String>,
+    actions: Vec<DrawerCustomAction>,
     items: Vec<DrawerItem>,
 }
 
@@ -109,9 +110,52 @@ struct DrawerPluginView {
     error: Option<String>,
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn extract_wsl_home_from_str(s: &str) -> Option<PathBuf> {
+    let norm = s.replace('/', "\\");
+    for prefix in ["\\\\wsl.localhost\\", "\\\\wsl$\\"] {
+        if let Some(pos) = norm.to_ascii_lowercase().find(prefix) {
+            let after = &norm[pos + prefix.len()..];
+            let mut parts = after.split('\\').filter(|p| !p.is_empty());
+            let distro = parts.next()?;
+            let home_kw = parts.next()?;
+            if home_kw.eq_ignore_ascii_case("home") {
+                let user = parts.next()?;
+                return Some(PathBuf::from(format!(
+                    "\\\\wsl.localhost\\{distro}\\home\\{user}"
+                )));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn detect_wsl_home_on_windows() -> Option<PathBuf> {
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(h) = extract_wsl_home_from_str(&cwd.to_string_lossy())
+    {
+        return Some(h);
+    }
+    let win_home = std::env::var_os("USERPROFILE").map(PathBuf::from)?;
+    let win_cfg = win_home
+        .join(".config")
+        .join("conductty")
+        .join("config.conductty");
+    if let Ok(raw) = fs::read_to_string(win_cfg)
+        && let Some(h) = extract_wsl_home_from_str(&raw)
+    {
+        return Some(h);
+    }
+    None
+}
+
 fn home_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
+        if let Some(wsl_home) = detect_wsl_home_on_windows() {
+            return Some(wsl_home);
+        }
         std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
@@ -184,7 +228,7 @@ fn save_ui_state(state_path: Option<&Path>, state: &DocsUiState) {
     }
 }
 
-fn resolve_default_save_dir(cfg: &DocsPluginConfig) -> String {
+fn resolve_default_dir(cfg: &DocsPluginConfig) -> String {
     let candidate = cfg.default_dir.trim();
     if !candidate.is_empty() {
         candidate.to_string()
@@ -197,7 +241,18 @@ fn resolve_default_save_dir(cfg: &DocsPluginConfig) -> String {
     }
 }
 
-fn ensure_default_dir_exists(dir_str: &str) -> PathBuf {
+fn resolve_active_dir(cfg: &DocsPluginConfig, state: &DocsUiState) -> String {
+    let default_dir = resolve_default_dir(cfg);
+    state
+        .active_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&default_dir)
+        .to_string()
+}
+
+fn ensure_dir_exists(dir_str: &str) -> PathBuf {
     let expanded = expand_tilde(dir_str);
     let _ = fs::create_dir_all(&expanded);
     expanded
@@ -351,38 +406,36 @@ fn build_dir_picker_view(
         .as_deref()
         .unwrap_or(active_raw)
         .to_string();
-    let browsing_path = ensure_default_dir_exists(&browsing_raw);
+    let browsing_path = expand_tilde(&browsing_raw);
     let browsing_display = abbreviate_home(&browsing_path);
 
-    let default_save = resolve_default_save_dir(cfg);
+    let default_dir = resolve_default_dir(cfg);
     let mut bookmarks: Vec<String> = Vec::new();
-    for cand in std::iter::once(&default_save)
+    for cand in std::iter::once(&default_dir)
         .chain(cfg.dirs.iter())
         .chain(state.recent_dirs.iter())
     {
-        let trimmed = cand.trim();
+        let trimmed = cand.trim().trim_end_matches('/');
         if !trimmed.is_empty() && !bookmarks.iter().any(|b| b == trimmed) {
             bookmarks.push(trimmed.to_string());
         }
     }
 
+    let active_expanded = expand_tilde(active_raw);
     let bookmark_items: Vec<DrawerItem> = bookmarks
         .into_iter()
         .map(|dir_str| {
             let expanded = expand_tilde(&dir_str);
-            let is_active = expanded == expand_tilde(active_raw);
-            let badge = if is_active {
-                Some("ACTIVE".to_string())
-            } else if dir_str == default_save {
-                Some("DEFAULT".to_string())
+            let badge = if expanded == active_expanded {
+                Some("CURRENT".to_string())
             } else {
-                Some("DIR".to_string())
+                None
             };
             let full = expanded.to_string_lossy().into_owned();
             DrawerItem {
                 id: full.clone(),
-                title: dir_str.clone(),
-                subtitle: full.clone(),
+                title: dir_str,
+                subtitle: String::new(),
                 badge,
                 url: String::new(),
                 body: None,
@@ -390,14 +443,14 @@ fn build_dir_picker_view(
                 actions: vec![
                     DrawerCustomAction {
                         id: "select_dir".to_string(),
-                        label: "Select as Save Dir".to_string(),
+                        label: "Open".to_string(),
                         key: None,
                         needs_input: false,
                         input_placeholder: None,
                     },
                     DrawerCustomAction {
                         id: "browse_dir".to_string(),
-                        label: "Browse Subfolders".to_string(),
+                        label: "Subfolders".to_string(),
                         key: None,
                         needs_input: false,
                         input_placeholder: None,
@@ -414,23 +467,23 @@ fn build_dir_picker_view(
         let parent_str = parent.to_string_lossy().into_owned();
         folder_items.push(DrawerItem {
             id: parent_str.clone(),
-            title: ".. (Parent Directory)".to_string(),
+            title: ".. (Parent)".to_string(),
             subtitle: abbreviate_home(parent),
-            badge: Some("UP".to_string()),
+            badge: None,
             url: String::new(),
             body: None,
             send_text: Some(parent_str),
             actions: vec![
                 DrawerCustomAction {
                     id: "browse_dir".to_string(),
-                    label: "Browse Parent".to_string(),
+                    label: "Subfolders".to_string(),
                     key: None,
                     needs_input: false,
                     input_placeholder: None,
                 },
                 DrawerCustomAction {
                     id: "select_dir".to_string(),
-                    label: "Select Parent".to_string(),
+                    label: "Open".to_string(),
                     key: None,
                     needs_input: false,
                     input_placeholder: None,
@@ -449,22 +502,22 @@ fn build_dir_picker_view(
         folder_items.push(DrawerItem {
             id: full.clone(),
             title: format!("{name}/"),
-            subtitle: abbreviate_home(&sub),
-            badge: Some("DIR".to_string()),
+            subtitle: String::new(),
+            badge: None,
             url: String::new(),
             body: None,
             send_text: Some(full),
             actions: vec![
                 DrawerCustomAction {
                     id: "select_dir".to_string(),
-                    label: "Select as Save Dir".to_string(),
+                    label: "Open".to_string(),
                     key: None,
                     needs_input: false,
                     input_placeholder: None,
                 },
                 DrawerCustomAction {
                     id: "browse_dir".to_string(),
-                    label: "Browse".to_string(),
+                    label: "Subfolders".to_string(),
                     key: None,
                     needs_input: false,
                     input_placeholder: None,
@@ -474,42 +527,44 @@ fn build_dir_picker_view(
     }
 
     DrawerPluginView {
-        title: format!("Select Dir ({browsing_display})"),
+        title: "Select Directory".to_string(),
         sections: vec![
             DrawerSection {
                 id: "bookmarks".to_string(),
-                title: "Saved & Configured Directories".to_string(),
+                title: "Bookmarks".to_string(),
                 accent: Some("#7aa2f7".to_string()),
+                actions: Vec::new(),
                 items: bookmark_items,
             },
             DrawerSection {
                 id: "subfolders".to_string(),
-                title: format!("Folders in {browsing_display}"),
+                title: browsing_display.clone(),
                 accent: Some("#c3e88d".to_string()),
+                actions: Vec::new(),
                 items: folder_items,
             },
         ],
         actions: vec![
             DrawerCustomAction {
                 id: "exit_select_dir".to_string(),
-                label: "<- Back to Notes".to_string(),
+                label: "<- Back".to_string(),
                 key: None,
                 needs_input: false,
                 input_placeholder: None,
             },
             DrawerCustomAction {
                 id: "select_browsing_dir".to_string(),
-                label: format!("Use {browsing_display}"),
+                label: format!("Open {browsing_display}"),
                 key: None,
                 needs_input: false,
                 input_placeholder: None,
             },
             DrawerCustomAction {
-                id: "create_subfolder".to_string(),
-                label: "+ New Folder".to_string(),
+                id: "open_dir_input".to_string(),
+                label: "Path...".to_string(),
                 key: None,
                 needs_input: true,
-                input_placeholder: Some("folder-name".to_string()),
+                input_placeholder: Some("~/notes or ~/work/obsidian_git".to_string()),
             },
         ],
         effects,
@@ -523,16 +578,8 @@ fn build_docs_view(
     effects: Vec<DrawerEffect>,
     error: Option<String>,
 ) -> DrawerPluginView {
-    let default_save = resolve_default_save_dir(cfg);
-    let active_raw = state
-        .active_dir
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(&default_save)
-        .to_string();
-
-    // デフォルト（または選択中）のメモ保存先ディレクトリが無ければ自動作成する
-    let active_expanded = ensure_default_dir_exists(&active_raw);
+    let active_raw = resolve_active_dir(cfg, state);
+    let active_expanded = ensure_dir_exists(&active_raw);
     let active_display = abbreviate_home(&active_expanded);
 
     if state.picker_open {
@@ -540,103 +587,64 @@ fn build_docs_view(
     }
 
     let limit = cfg.limit.clamp(1, 200);
-    let mut ordered_dirs: Vec<(String, PathBuf, bool)> =
-        vec![(active_display.clone(), active_expanded.clone(), true)];
+    let mut entries = Vec::new();
+    collect_docs_in_dir(&active_expanded, 3, &mut entries);
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(limit);
 
-    for raw_dir in &cfg.dirs {
-        let exp = expand_tilde(raw_dir);
-        if !ordered_dirs.iter().any(|(_, p, _)| *p == exp) {
-            ordered_dirs.push((raw_dir.clone(), exp, false));
-        }
-    }
-
-    let accents = ["#7aa2f7", "#c3e88d", "#ff9e64", "#bb9af7"];
-    let mut sections = Vec::new();
-
-    for (idx, (label, expanded, is_save_dir)) in ordered_dirs.into_iter().enumerate() {
-        let mut entries = Vec::new();
-        collect_docs_in_dir(&expanded, 1, &mut entries);
-        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        entries.truncate(limit);
-
-        let items: Vec<DrawerItem> = entries
-            .into_iter()
-            .map(|(path, _, badge)| {
-                let body = read_doc_preview(&path);
-                let title = extract_doc_title(&path, &body);
-                let rel = path
-                    .strip_prefix(&expanded)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let subtitle = format!("{label}/{rel}");
-                let full_path = path.to_string_lossy().into_owned();
-                DrawerItem {
-                    id: full_path.clone(),
-                    title,
-                    subtitle,
-                    badge: Some(badge.to_string()),
-                    url: String::new(),
-                    body: Some(body),
-                    send_text: Some(full_path),
-                    actions: vec![
-                        DrawerCustomAction {
-                            id: "edit_in_pane".to_string(),
-                            label: "Open in Editor".to_string(),
-                            key: Some("e".to_string()),
-                            needs_input: false,
-                            input_placeholder: None,
-                        },
-                        DrawerCustomAction {
-                            id: "copy_path".to_string(),
-                            label: "Copy Path".to_string(),
-                            key: Some("y".to_string()),
-                            needs_input: false,
-                            input_placeholder: None,
-                        },
-                    ],
-                }
-            })
-            .collect();
-
-        let section_title = if is_save_dir {
-            format!("Save Dir: {label}")
-        } else {
-            label
-        };
-
-        sections.push(DrawerSection {
-            id: format!("dir_{idx}"),
-            title: section_title,
-            accent: Some(accents[idx % accents.len()].to_string()),
-            items,
-        });
-    }
+    let items: Vec<DrawerItem> = entries
+        .into_iter()
+        .map(|(path, _, _badge)| {
+            let body = read_doc_preview(&path);
+            let title = extract_doc_title(&path, &body);
+            let rel = path
+                .strip_prefix(&active_expanded)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let full_path = path.to_string_lossy().into_owned();
+            DrawerItem {
+                id: full_path.clone(),
+                title,
+                subtitle: rel,
+                badge: None,
+                url: String::new(),
+                body: Some(body),
+                send_text: Some(full_path),
+                actions: vec![DrawerCustomAction {
+                    id: "edit_in_pane".to_string(),
+                    label: "Edit".to_string(),
+                    key: Some("e".to_string()),
+                    needs_input: false,
+                    input_placeholder: None,
+                }],
+            }
+        })
+        .collect();
 
     DrawerPluginView {
-        title: format!("Docs ({active_display})"),
-        sections,
+        title: "Docs".to_string(),
+        sections: vec![DrawerSection {
+            id: "active_dir".to_string(),
+            title: active_display.clone(),
+            accent: Some("#7aa2f7".to_string()),
+            actions: Vec::new(),
+            items,
+        }],
         actions: vec![
             DrawerCustomAction {
                 id: "new_note".to_string(),
                 label: "+ New Note".to_string(),
                 key: Some("n".to_string()),
                 needs_input: true,
-                input_placeholder: Some(format!("New note in {active_display}...")),
+                input_placeholder: Some("note-name.md or Title".to_string()),
             },
             DrawerCustomAction {
                 id: "enter_select_dir".to_string(),
-                label: "Select Dir".to_string(),
+                label: "Change Dir".to_string(),
                 key: Some("d".to_string()),
                 needs_input: false,
                 input_placeholder: None,
-            },
-            DrawerCustomAction {
-                id: "open_dir_input".to_string(),
-                label: "Open Path...".to_string(),
-                key: None,
-                needs_input: true,
-                input_placeholder: Some("~/notes or /path/to/docs".to_string()),
             },
         ],
         effects,
@@ -652,17 +660,12 @@ fn handle_request_with_state_path(
     let mut effects = Vec::new();
     let mut error = None;
 
-    let default_save = resolve_default_save_dir(&req.config);
-    let current_active = state
-        .active_dir
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| default_save.clone());
+    let current_active = resolve_active_dir(&req.config, &state);
 
     if req.method == "action" {
         match req.action_id.as_deref() {
             Some("new_note") => {
-                let save_dir = ensure_default_dir_exists(&current_active);
+                let save_dir = ensure_dir_exists(&current_active);
                 let input = req.input.unwrap_or_default();
                 if let Err(e) = create_new_note(&save_dir, &input) {
                     error = Some(e);
@@ -670,9 +673,7 @@ fn handle_request_with_state_path(
             }
             Some("enter_select_dir") => {
                 state.picker_open = true;
-                if state.browsing_dir.is_none() {
-                    state.browsing_dir = Some(current_active);
-                }
+                state.browsing_dir = Some(current_active);
                 save_ui_state(state_path, &state);
             }
             Some("exit_select_dir") => {
@@ -693,7 +694,7 @@ fn handle_request_with_state_path(
             }
             Some("select_dir") => {
                 if let Some(target_dir) = req.item_id {
-                    let expanded = ensure_default_dir_exists(&target_dir);
+                    let expanded = ensure_dir_exists(&target_dir);
                     if expanded.is_dir() {
                         let abbr = abbreviate_home(&expanded);
                         state.active_dir = Some(abbr.clone());
@@ -708,7 +709,7 @@ fn handle_request_with_state_path(
             }
             Some("select_browsing_dir") => {
                 let target = state.browsing_dir.clone().unwrap_or(current_active);
-                let expanded = ensure_default_dir_exists(&target);
+                let expanded = ensure_dir_exists(&target);
                 if expanded.is_dir() {
                     let abbr = abbreviate_home(&expanded);
                     state.active_dir = Some(abbr.clone());
@@ -721,7 +722,7 @@ fn handle_request_with_state_path(
                 let raw = req.input.unwrap_or_default();
                 let trimmed = raw.trim();
                 if !trimmed.is_empty() {
-                    let expanded = ensure_default_dir_exists(trimmed);
+                    let expanded = ensure_dir_exists(trimmed);
                     if expanded.is_dir() {
                         let abbr = abbreviate_home(&expanded);
                         state.active_dir = Some(abbr.clone());
@@ -731,31 +732,6 @@ fn handle_request_with_state_path(
                         save_ui_state(state_path, &state);
                     } else {
                         error = Some(format!("Failed to open directory: {trimmed}"));
-                    }
-                }
-            }
-            Some("create_subfolder") => {
-                let base_raw = state.browsing_dir.clone().unwrap_or(current_active);
-                let base_dir = ensure_default_dir_exists(&base_raw);
-                let raw_name = req.input.unwrap_or_default();
-                let clean_name: String = raw_name
-                    .trim()
-                    .chars()
-                    .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
-                    .collect();
-                if clean_name.is_empty() {
-                    error = Some("Folder name is empty".to_string());
-                } else {
-                    let new_sub = base_dir.join(&clean_name);
-                    match fs::create_dir_all(&new_sub) {
-                        Ok(()) => {
-                            let abbr = abbreviate_home(&new_sub);
-                            state.browsing_dir = Some(abbr);
-                            save_ui_state(state_path, &state);
-                        }
-                        Err(e) => {
-                            error = Some(format!("Failed to create folder: {e}"));
-                        }
                     }
                 }
             }
@@ -816,27 +792,37 @@ mod tests {
     }
 
     #[test]
-    fn creates_default_dir_switches_directories_and_creates_notes() {
+    fn extracts_wsl_home_from_unc_path() {
+        let unc =
+            r"include = '\\wsl.localhost\Ubuntu\home\maresuke\work\conductty\config.conductty'";
+        let extracted = extract_wsl_home_from_str(unc).unwrap();
+        assert_eq!(
+            extracted,
+            PathBuf::from(r"\\wsl.localhost\Ubuntu\home\maresuke")
+        );
+    }
+
+    #[test]
+    fn displays_single_directory_and_switches_via_picker() {
         let temp_root = std::env::temp_dir().join(format!(
-            "conductty-docs-dirpicker-test-{}",
+            "conductty-docs-single-dir-test-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&temp_root);
         let default_dir = temp_root.join("notes");
-        let alt_dir = temp_root.join("work_docs");
+        let alt_dir = temp_root.join("obsidian");
+        let _ = fs::create_dir_all(&alt_dir);
+        let _ = fs::write(alt_dir.join("spec.md"), "# Spec Doc\nHello");
         let state_file = temp_root.join("state.json");
 
         let cfg = DocsPluginConfig {
             default_dir: default_dir.to_string_lossy().into_owned(),
-            dirs: vec![
-                default_dir.to_string_lossy().into_owned(),
-                alt_dir.to_string_lossy().into_owned(),
-            ],
+            dirs: vec![alt_dir.to_string_lossy().into_owned()],
             limit: 10,
             editor: Some("nvim".to_string()),
         };
 
-        // 1. Initial fetch automatically creates `default_dir` even if it didn't exist
+        // 1. Initial fetch creates `default_dir` and displays ONLY 1 directory section
         let fetch_view = handle_request_with_state_path(
             PluginRequest {
                 config: cfg.clone(),
@@ -845,48 +831,23 @@ mod tests {
             Some(&state_file),
         );
         assert!(default_dir.is_dir());
-        assert!(fetch_view.error.is_none());
+        assert_eq!(fetch_view.sections.len(), 1);
 
-        // 2. Enter directory picker mode from UI
-        let picker_view = handle_request_with_state_path(
-            PluginRequest {
-                method: "action".to_string(),
-                action_id: Some("enter_select_dir".to_string()),
-                config: cfg.clone(),
-                ..Default::default()
-            },
-            Some(&state_file),
-        );
-        assert!(picker_view.title.starts_with("Select Dir"));
-
-        // 3. Select `alt_dir` as active save directory from the UI picker
+        // 2. Switch directory to `alt_dir`
         let switched_view = handle_request_with_state_path(
             PluginRequest {
                 method: "action".to_string(),
                 action_id: Some("select_dir".to_string()),
                 item_id: Some(alt_dir.to_string_lossy().into_owned()),
-                config: cfg.clone(),
-                ..Default::default()
-            },
-            Some(&state_file),
-        );
-        assert!(alt_dir.is_dir());
-        assert!(!switched_view.title.starts_with("Select Dir"));
-
-        // 4. Create a new note -> saved inside `alt_dir` (the newly selected save directory)
-        let created_view = handle_request_with_state_path(
-            PluginRequest {
-                method: "action".to_string(),
-                action_id: Some("new_note".to_string()),
-                input: Some("Sprint Plan".to_string()),
                 config: cfg,
                 ..Default::default()
             },
             Some(&state_file),
         );
-        assert!(created_view.error.is_none());
-        assert!(alt_dir.join("Sprint-Plan.md").is_file());
-        assert_eq!(created_view.sections[0].items[0].title, "Sprint Plan");
+        assert_eq!(switched_view.sections.len(), 1);
+        assert_eq!(switched_view.sections[0].items.len(), 1);
+        assert_eq!(switched_view.sections[0].items[0].title, "Spec Doc");
+        assert_eq!(switched_view.sections[0].items[0].subtitle, "spec.md");
 
         let _ = fs::remove_dir_all(&temp_root);
     }
