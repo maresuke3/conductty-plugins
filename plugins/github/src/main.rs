@@ -72,6 +72,39 @@ struct GhSearchRow {
     repository: GhRepo,
 }
 
+#[derive(Debug, Deserialize)]
+struct GqlResponse {
+    data: Option<GqlData>,
+    #[serde(default)]
+    errors: Vec<GqlError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlData {
+    review_requested: Option<GqlSearch>,
+    assigned_prs: Option<GqlSearch>,
+    assigned_issues: Option<GqlSearch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlSearch {
+    // SAML 保護等で参照できないノードは null で返る
+    nodes: Vec<Option<GhSearchRow>>,
+}
+
+const SEARCH_QUERY: &str = "query($limit: Int!, $rr: String!, $ap: String!, $ai: String!) { \
+review_requested: search(type: ISSUE, first: $limit, query: $rr) { ...Rows } \
+assigned_prs: search(type: ISSUE, first: $limit, query: $ap) { ...Rows } \
+assigned_issues: search(type: ISSUE, first: $limit, query: $ai) { ...Rows } } \
+fragment Rows on SearchResultItemConnection { nodes { \
+... on PullRequest { number title url repository { nameWithOwner } } \
+... on Issue { number title url repository { nameWithOwner } } } }";
+
 fn validate_http_url(url: &str) -> Result<&str, String> {
     let trimmed = url.trim();
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
@@ -105,28 +138,55 @@ fn sanitize_terminal_text(s: &str) -> String {
     out
 }
 
-fn parse_gh_search_json(json_str: &str, badge: &str) -> Result<Vec<DrawerItem>, serde_json::Error> {
-    let rows: Vec<GhSearchRow> = serde_json::from_str(json_str)?;
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let safe_url = validate_http_url(&r.url)
-                .map(str::to_string)
-                .unwrap_or_default();
-            let repo = sanitize_terminal_text(&r.repository.name_with_owner);
-            let title = sanitize_terminal_text(&r.title);
-            let subtitle = format!("{repo} #{}", r.number);
-            let send_text = format!("[{subtitle}] {title} ({safe_url})");
-            DrawerItem {
-                id: format!("{}#{}", r.repository.name_with_owner, r.number),
-                title: r.title,
-                subtitle,
-                badge: Some(badge.to_string()),
-                url: safe_url,
-                send_text: Some(send_text),
-            }
-        })
-        .collect())
+fn row_to_item(r: GhSearchRow, badge: &str) -> DrawerItem {
+    let safe_url = validate_http_url(&r.url)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let repo = sanitize_terminal_text(&r.repository.name_with_owner);
+    let title = sanitize_terminal_text(&r.title);
+    let subtitle = format!("{repo} #{}", r.number);
+    let send_text = format!("[{subtitle}] {title} ({safe_url})");
+    DrawerItem {
+        id: format!("{}#{}", r.repository.name_with_owner, r.number),
+        title: r.title,
+        subtitle,
+        badge: Some(badge.to_string()),
+        url: safe_url,
+        send_text: Some(send_text),
+    }
+}
+
+/// gh api graphql の出力を (Review Requested, Assigned PRs, Assigned Issues, GraphQL エラー) に変換する
+type SearchResult = (
+    Vec<DrawerItem>,
+    Vec<DrawerItem>,
+    Vec<DrawerItem>,
+    Vec<String>,
+);
+
+fn parse_graphql_response(json_str: &str) -> Result<SearchResult, serde_json::Error> {
+    let resp: GqlResponse = serde_json::from_str(json_str)?;
+    let items = |search: Option<GqlSearch>, badge: &str| -> Vec<DrawerItem> {
+        search
+            .map(|s| {
+                s.nodes
+                    .into_iter()
+                    .flatten()
+                    .map(|r| row_to_item(r, badge))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (rr, ap, ai) = resp
+        .data
+        .map(|d| (d.review_requested, d.assigned_prs, d.assigned_issues))
+        .unwrap_or_default();
+    Ok((
+        items(rr, "PR"),
+        items(ap, "PR"),
+        items(ai, "Issue"),
+        resp.errors.into_iter().map(|e| e.message).collect(),
+    ))
 }
 
 fn apply_no_window(cmd: &mut Command) {
@@ -138,7 +198,7 @@ fn apply_no_window(cmd: &mut Command) {
     let _ = cmd;
 }
 
-async fn run_gh_search(args: &[&str], badge: &str) -> Result<Vec<DrawerItem>, String> {
+async fn run_gh(args: &[&str]) -> Result<std::process::Output, String> {
     let mut gh_cmd = Command::new("gh");
     gh_cmd.args(args);
     apply_no_window(&mut gh_cmd);
@@ -175,89 +235,56 @@ async fn run_gh_search(args: &[&str], badge: &str) -> Result<Vec<DrawerItem>, St
         }
         Err(e) => return Err(format!("gh 起動失敗: {e}")),
     };
+    Ok(output)
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            format!("gh 終了コード: {}", output.status)
-        } else {
-            stderr
-        });
+fn gh_failure_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!("gh 終了コード: {}", output.status)
+    } else {
+        stderr
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_gh_search_json(&stdout, badge).map_err(|e| format!("JSON パース失敗: {e}"))
 }
 
 async fn fetch_github_view(cfg: &GitHubPluginConfig) -> DrawerPluginView {
-    let limit_str = cfg.limit.clamp(1, 100).to_string();
-    let rev_args = [
-        "search",
-        "prs",
-        "--review-requested",
-        "@me",
-        "--state",
-        "open",
-        "--limit",
-        limit_str.as_str(),
-        "--json",
-        "number,title,url,repository",
+    let query_arg = format!("query={SEARCH_QUERY}");
+    let limit_arg = format!("limit={}", cfg.limit.clamp(1, 100));
+    let args = [
+        "api",
+        "graphql",
+        "-f",
+        query_arg.as_str(),
+        "-F",
+        limit_arg.as_str(),
+        "-f",
+        "rr=is:pr is:open review-requested:@me",
+        "-f",
+        "ap=is:pr is:open assignee:@me",
+        "-f",
+        "ai=is:issue is:open assignee:@me",
     ];
-    let pr_args = [
-        "search",
-        "prs",
-        "--assignee",
-        "@me",
-        "--state",
-        "open",
-        "--limit",
-        limit_str.as_str(),
-        "--json",
-        "number,title,url,repository",
-    ];
-    let issue_args = [
-        "search",
-        "issues",
-        "--assignee",
-        "@me",
-        "--state",
-        "open",
-        "--limit",
-        limit_str.as_str(),
-        "--json",
-        "number,title,url,repository",
-    ];
-    let review_fut = run_gh_search(&rev_args, "PR");
-    let assigned_pr_fut = run_gh_search(&pr_args, "PR");
-    let issue_fut = run_gh_search(&issue_args, "Issue");
 
-    let (rev_res, pr_res, issue_res) = tokio::join!(review_fut, assigned_pr_fut, issue_fut);
-    let mut errors = Vec::new();
-
-    let review_items = match rev_res {
-        Ok(list) => list,
-        Err(e) => {
-            errors.push(e);
-            Vec::new()
-        }
-    };
-    let assigned_pr_items = match pr_res {
-        Ok(list) => list,
-        Err(e) => {
-            if !errors.contains(&e) {
-                errors.push(e);
+    // GraphQL エラー時も gh は非ゼロ終了しつつ stdout に data/errors を返すので、まず stdout を解釈する
+    let (review_items, assigned_pr_items, issue_items, errors) = match run_gh(&args).await {
+        Err(e) => (Vec::new(), Vec::new(), Vec::new(), vec![e]),
+        Ok(out) => match parse_graphql_response(&String::from_utf8_lossy(&out.stdout)) {
+            Ok((rr, ap, ai, errs)) if out.status.success() || !errs.is_empty() => {
+                (rr, ap, ai, errs)
             }
-            Vec::new()
-        }
-    };
-    let issue_items = match issue_res {
-        Ok(list) => list,
-        Err(e) => {
-            if !errors.contains(&e) {
-                errors.push(e);
-            }
-            Vec::new()
-        }
+            Err(e) if out.status.success() => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![format!("JSON パース失敗: {e}")],
+            ),
+            _ => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![gh_failure_message(&out)],
+            ),
+        },
     };
 
     DrawerPluginView {
@@ -312,35 +339,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_gh_search_output() {
-        let raw = r#"[
-            {
+    fn parses_graphql_search_output() {
+        let raw = r#"{"data": {
+            "review_requested": {"nodes": [{
                 "number": 42,
                 "title": "Add right drawer plugin",
                 "url": "https://github.com/maresuke3/conductty/pull/42",
                 "repository": { "nameWithOwner": "maresuke3/conductty" }
-            }
-        ]"#;
-        let items = parse_gh_search_json(raw, "PR").unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, "maresuke3/conductty#42");
-        assert_eq!(items[0].subtitle, "maresuke3/conductty #42");
-        assert_eq!(items[0].badge.as_deref(), Some("PR"));
+            }]},
+            "assigned_prs": {"nodes": []},
+            "assigned_issues": {"nodes": [null, {
+                "number": 7,
+                "title": "Bug",
+                "url": "https://github.com/a/b/issues/7",
+                "repository": { "nameWithOwner": "a/b" }
+            }]}
+        }}"#;
+        let (rr, ap, ai, errs) = parse_graphql_response(raw).unwrap();
+        assert_eq!(rr.len(), 1);
+        assert_eq!(rr[0].id, "maresuke3/conductty#42");
+        assert_eq!(rr[0].subtitle, "maresuke3/conductty #42");
+        assert_eq!(rr[0].badge.as_deref(), Some("PR"));
+        assert_eq!(rr[0].url, "https://github.com/maresuke3/conductty/pull/42");
+        assert!(ap.is_empty());
+        assert_eq!(ai.len(), 1);
+        assert_eq!(ai[0].badge.as_deref(), Some("Issue"));
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn keeps_partial_data_and_reports_graphql_errors() {
+        let raw = r#"{"data": {"review_requested": null, "assigned_prs": {"nodes": [null]},
+            "assigned_issues": null},
+            "errors": [{"message": "Resource protected by organization SAML enforcement."}]}"#;
+        let (rr, ap, ai, errs) = parse_graphql_response(raw).unwrap();
+        assert!(rr.is_empty() && ap.is_empty() && ai.is_empty());
         assert_eq!(
-            items[0].url,
-            "https://github.com/maresuke3/conductty/pull/42"
+            errs,
+            vec!["Resource protected by organization SAML enforcement."]
         );
     }
 
     #[test]
     fn rejects_malicious_urls_and_sanitizes_send_text() {
-        let malicious_json = r#"[{
+        let malicious_json = r#"{"data": {"review_requested": null, "assigned_prs": null,
+            "assigned_issues": {"nodes": [{
             "number": 1,
             "title": "Fix\r\nrm -rf /",
             "url": "javascript:alert(1)",
             "repository": { "nameWithOwner": "a/b" }
-        }]"#;
-        let parsed = parse_gh_search_json(malicious_json, "Issue").unwrap();
+        }]}}}"#;
+        let (_, _, parsed, _) = parse_graphql_response(malicious_json).unwrap();
         assert_eq!(parsed[0].url, "");
         assert!(!parsed[0].send_text.as_deref().unwrap().contains('\n'));
     }
